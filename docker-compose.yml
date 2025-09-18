@@ -1,0 +1,74 @@
+services:
+  # MySQL 8.0 - 개발용 설정
+  mysql:
+    image: mysql:8.0
+    container_name: mysql
+    restart: "no"  # 수동 제어를 위해 자동 재시작 비활성화
+    environment:
+      MYSQL_ROOT_PASSWORD: root123$
+    ports:
+      - "3306:3306"  # 표준 MySQL 포트
+    volumes:
+      - mysql_data:/var/lib/mysql                    # 데이터 저장소
+      - ./mysql-config:/etc/mysql/conf.d             # 설정 파일
+    command: --default-authentication-plugin=mysql_native_password
+    networks:
+      - db-network
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      timeout: 20s
+      retries: 10
+
+  # MariaDB 10.11 - 개발용 설정  
+  mariadb:
+    image: mariadb:10.11
+    container_name: mariadb
+    restart: "no"  # 수동 제어를 위해 자동 재시작 비활성화
+    environment:
+      MYSQL_ROOT_PASSWORD: root123$
+    ports:
+      - "3306:3306"  # MySQL과 동일 포트 (상호 배타적 실행)
+    volumes:
+      - mariadb_data:/var/lib/mysql                  # 독립적인 데이터 저장소
+      - ./mariadb-config:/etc/mysql/conf.d           # 설정 파일
+    networks:
+      - db-network
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      timeout: 20s
+      retries: 10
+
+  # phpMyAdmin - 웹 기반 데이터베이스 관리 도구 (선택사항)
+  phpmyadmin:
+    image: phpmyadmin/phpmyadmin:latest
+    container_name: phpmyadmin
+    restart: "no"
+    environment:
+      PMA_ARBITRARY: 1                    # 임의의 서버 연결 허용
+      PMA_HOST: host.docker.internal      # Docker 호스트의 DB에 연결
+      PMA_PORT: 3306
+      PMA_USER: root
+      UPLOAD_LIMIT: 64M                   # 파일 업로드 제한
+      MEMORY_LIMIT: 512M                  # 메모리 제한
+    ports:
+      - "8080:80"                         # 웹 접속 포트
+    networks:
+      - db-network
+    depends_on:
+      - mysql
+      - mariadb
+
+# 데이터 볼륨 정의 - 완전히 독립적인 저장소
+volumes:
+  mysql_data:
+    driver: local
+    name: mysql_data_volume              # MySQL 전용 볼륨
+  mariadb_data:
+    driver: local  
+    name: mariadb_data_volume            # MariaDB 전용 볼륨
+
+# 네트워크 정의
+networks:
+  db-network:
+    driver: bridge
+    name: database_network
