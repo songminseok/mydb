@@ -82,6 +82,88 @@ backup_db() {
     return $rc
 }
 
+# 원격 DB 백업
+backup_remote() {
+	cd_to_root
+	BACKUP_DIR="$DB_DIR/backups"
+	DATE=$(date +%Y%m%d_%H%M%S)
+
+	local host="$1"
+	local user="$2"
+	local dbspec="$3" # all | db1,db2 | 특정 DB 하나
+	local port="${4:-3306}"
+	local opt5="$5"
+
+	if [ -z "$host" ] || [ -z "$user" ]; then
+		echo -e "${RED}❌ 사용법: $0 backup-remote <host> <user> [all|db1,db2] [port] [--gzip]${NC}"
+		return 1
+	fi
+
+	mkdir -p "$BACKUP_DIR"
+
+	local compress=0
+	if [ "$opt5" = "--gzip" ] || [ "$opt5" = "--gz" ]; then
+		compress=1
+	fi
+
+	# 덤프 대상 구성
+	local dump_target
+	local outfile_base
+	if [ -z "$dbspec" ] || [ "$dbspec" = "all" ] || [ "$dbspec" = "--all" ]; then
+		dump_target="--all-databases"
+		outfile_base="remote_${host}_all_${DATE}"
+	else
+		# 콤마 구분을 공백으로 변환하여 --databases 인자로 전달
+		local databases
+		databases=$(echo "$dbspec" | tr ',' ' ')
+		dump_target="--databases $databases"
+		outfile_base="remote_${host}_databases_${DATE}"
+	fi
+
+	# 공통 mysqldump 옵션
+	local common_opts="--single-transaction --routines --triggers --events --set-gtid-purged=OFF --column-statistics=0"
+
+	# 비밀번호 처리: 환경변수 MYSQL_PWD가 없으면 안전하게 입력 받기
+	if [ -z "$MYSQL_PWD" ]; then
+		read -s -p "🔑 ${user}@${host} 비밀번호: " MYSQL_PWD
+		echo
+	fi
+
+	echo -e "${YELLOW}💾 ${host}:${port} 원격 백업을 시작합니다...${NC}"
+
+	local rc=0
+	if command -v mysqldump >/dev/null 2>&1; then
+		# 로컬 클라이언트 사용
+		if [ $compress -eq 1 ]; then
+			MYSQL_PWD="$MYSQL_PWD" mysqldump -h "$host" -P "$port" -u "$user" $common_opts $dump_target | gzip > "$BACKUP_DIR/${outfile_base}.sql.gz"
+			rc=${PIPESTATUS[0]}
+		else
+			MYSQL_PWD="$MYSQL_PWD" mysqldump -h "$host" -P "$port" -u "$user" $common_opts $dump_target > "$BACKUP_DIR/${outfile_base}.sql"
+			rc=$?
+		fi
+	else
+		# 도커 이미지의 mysqldump 사용 (호스트에 클라이언트 미설치 시)
+		if [ $compress -eq 1 ]; then
+			docker run --rm -e MYSQL_PWD="$MYSQL_PWD" mysql:8.0 mysqldump -h "$host" -P "$port" -u "$user" $common_opts $dump_target | gzip > "$BACKUP_DIR/${outfile_base}.sql.gz"
+			rc=$?
+		else
+			docker run --rm -e MYSQL_PWD="$MYSQL_PWD" mysql:8.0 mysqldump -h "$host" -P "$port" -u "$user" $common_opts $dump_target > "$BACKUP_DIR/${outfile_base}.sql"
+			rc=$?
+		fi
+	fi
+
+	if [ $rc -eq 0 ]; then
+		if [ $compress -eq 1 ]; then
+			echo -e "${GREEN}✅ 백업 완료: $BACKUP_DIR/${outfile_base}.sql.gz${NC}"
+		else
+			echo -e "${GREEN}✅ 백업 완료: $BACKUP_DIR/${outfile_base}.sql${NC}"
+		fi
+	else
+		echo -e "${RED}❌ 원격 백업 실패 (exit $rc)${NC}"
+	fi
+	return $rc
+}
+
 # 복원 기능 (새로 추가)
 restore_db() {
     local db_type="$1"
@@ -92,10 +174,30 @@ restore_db() {
 
     if [ -z "$backup_file" ]; then
         echo -e "${BLUE}📋 사용 가능한 백업 파일:${NC}"
-        ls -la "$BACKUP_DIR"/*.sql 2>/dev/null || echo "백업 파일이 없습니다."
+        ls -la "$BACKUP_DIR"/*.sql "$BACKUP_DIR"/*.sql.gz 2>/dev/null || echo "백업 파일이 없습니다."
         return 1
     fi
 
+    # 서비스 해석 (mysql|mariadb|auto|current)
+    local service_resolved
+    case "$db_type" in
+        mysql|mariadb)
+            service_resolved="$db_type"
+            ;;
+        auto|current|"")
+            service_resolved="$(get_running_db)"
+            ;;
+        *)
+            service_resolved="invalid"
+            ;;
+    esac
+
+    if [ "$service_resolved" = "invalid" ] || [ "$service_resolved" = "none" ] || [ -z "$service_resolved" ]; then
+        echo -e "${RED}❌ 데이터베이스를 선택하거나 실행하세요. (mysql, mariadb, auto)${NC}"
+        return 1
+    fi
+
+    # 백업 파일 경로 정규화
     if [[ "$backup_file" != /* ]]; then
         backup_file="$BACKUP_DIR/$backup_file"
     fi
@@ -104,19 +206,27 @@ restore_db() {
         return 1
     fi
 
-    if ! is_valid_service "$db_type"; then
-        echo -e "${RED}❌ 데이터베이스를 선택하세요. (mysql, mariadb)${NC}"
-        return 1
-    fi
-
-    if ! is_up "$db_type"; then
-        echo -e "${YELLOW}⚠️ $(service_display_name "$db_type")가 실행되지 않았습니다. 시작합니다...${NC}"
-        start_db "$db_type"
+    # 대상 DB 준비
+    if ! is_up "$service_resolved"; then
+        echo -e "${YELLOW}⚠️ $(service_display_name "$service_resolved")가 실행되지 않았습니다. 시작합니다...${NC}"
+        start_db "$service_resolved"
         sleep 3
     fi
-    echo -e "${YELLOW}🔄 $(service_display_name "$db_type")로 데이터 복원 중...${NC}"
-    dc exec -T "$db_type" mysql -u root -p < "$backup_file"
-    local rc=$?
+
+    echo -e "${YELLOW}🔄 $(service_display_name "$service_resolved")로 데이터 복원 중...${NC}"
+
+    # .sql / .sql.gz 처리
+    local rc=0
+    if echo "$backup_file" | grep -qiE '\\.sql\\.gz$'; then
+        # gzip 압축 해제 후 컨테이너 mysql로 전달
+        gunzip -c "$backup_file" | dc exec -T "$service_resolved" sh -lc 'mysql -u root -p"$MYSQL_ROOT_PASSWORD"'
+        rc=${PIPESTATUS[1]:-${PIPESTATUS[0]}}
+    else
+        # 평문 SQL 파일을 컨테이너 mysql에 입력
+        dc exec -T "$service_resolved" sh -lc 'mysql -u root -p"$MYSQL_ROOT_PASSWORD"' < "$backup_file"
+        rc=$?
+    fi
+
     if [ $rc -eq 0 ]; then
         echo -e "${GREEN}✅ 복원이 완료되었습니다!${NC}"
     else
@@ -153,6 +263,7 @@ show_help() {
     echo "  connect [db]   - 데이터베이스 접속 (mysql, mariadb, auto)"
     echo "  logs [db]      - 로그 확인"
     echo "  backup [db]    - 데이터 백업 (mysql, mariadb, auto)"
+    echo "  backup-remote <host> <user> [all|db1,db2] [port] [--gzip]"
     echo "  restore [db] [file] - 데이터 복원"
     echo "  migrate [src] [dst] - 데이터 마이그레이션 (mysql→mariadb 등)"
     echo "  volumes        - 볼륨 정보 확인"
@@ -514,6 +625,9 @@ case $1 in
         ;;
     "backup")
         backup_db $2
+        ;;
+    "backup-remote")
+        backup_remote $2 $3 $4 $5 $6
         ;;
     "restore")
         restore_db $2 $3

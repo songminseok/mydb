@@ -61,6 +61,7 @@ mysql -h localhost -P 3306 -u root -p
 | `connect auto` | 현재 실행 중인 DB에 접속 |
 | `status` | 실행 상태 확인 |
 | `backup auto` | 현재 DB 백업 |
+| `backup-remote <host> <user> [all|db1,db2] [port] [--gzip]` | 원격 DB 백업 |
 | `stop current` | 현재 실행 중인 DB 중지 |
 | `volumes` | 데이터 볼륨 정보 확인 |
 | `clean` | 모든 컨테이너 및 볼륨 삭제 |
@@ -93,6 +94,16 @@ mysql -h localhost -P 3306 -u root -p
 
 # 특정 DB 백업 (실행 중이어야 함)
 ./db-manager.sh backup mysql
+
+# 원격 DB 백업 (로컬에 mysqldump 없으면 자동으로 Docker 이미지 사용)
+# 모든 데이터베이스
+./db-manager.sh backup-remote my.remote.host root all
+
+# 특정 데이터베이스들 (콤마 구분)
+./db-manager.sh backup-remote my.remote.host root "db1,db2" 3306
+
+# gzip 압축 출력
+./db-manager.sh backup-remote 10.0.0.5 admin all 3307 --gzip
 ```
 
 ### 복원
